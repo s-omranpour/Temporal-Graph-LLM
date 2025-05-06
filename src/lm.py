@@ -15,7 +15,7 @@ class TimeEmbedding(nn.Module):
         super().__init__()
         self.base_freqs = nn.Parameter(
             torch.randn(1, 1, dim // 2) * (2 * torch.pi / max_time), 
-            requires_grad=False
+            requires_grad=True
         )
         
     def forward(self, t):
@@ -25,19 +25,26 @@ class TGTransformer(L.LightningModule):
     def __init__(
             self, 
             n_vocab,
+            n_feat,
             d_hidden,
             d_mlp, 
             n_blocks = 2, 
             n_head = 4, 
             dropout=0.,
             lr=1e-3,
-            wd=0.01
+            wd=0.01,
+            neg_sampler=None,
+            evaluator=None
         ):
         super().__init__()
         self.lr = lr
         self.wd = wd
+        self.neg_sampler = neg_sampler
+        self.evaluator = evaluator
+        self.feat_embedding = nn.Linear(n_feat, d_hidden)
         self.node_embedding = nn.Embedding(n_vocab, d_hidden)
         self.time_embedding = TimeEmbedding(d_hidden)
+        self.proj = nn.Linear(3*d_hidden, d_hidden)
         
         blocks = []
         for _ in range(n_blocks):
@@ -50,6 +57,7 @@ class TGTransformer(L.LightningModule):
                 )
             ]
         self.blocks = nn.ModuleList(blocks)
+        self.dropout = nn.Dropout(dropout)
         self.head = nn.Sequential(
             nn.LayerNorm(d_hidden),
             nn.Dropout(dropout),
@@ -60,20 +68,50 @@ class TGTransformer(L.LightningModule):
         )
         self.criterion = nn.CrossEntropyLoss()
 
-    def forward(self, x, t):
-        h = self.node_embedding(x) + self.time_embedding(t)
+    def forward(self, x_ind, x_feat, x_time):
+        h = self.dropout(
+            self.proj(
+                torch.cat([
+                    self.feat_embedding(x_feat),
+                    self.node_embedding(x_ind), 
+                    self.time_embedding(x_time)
+                ], dim=-1)
+            )
+        )
         for i, block in enumerate(self.blocks):
             h = block(h)
         return self.head(h)
 
     def step(self, batch, mode='train'):
-        x, y, t = batch
-        logits = self.forward(x, t)
+        x_ind, x_feat, x_time, y = batch
+        logits = self.forward(x_ind, x_feat, x_time)
         loss = self.criterion(logits.transpose(1,2), y)
-        mrr = reciprocal_rank(logits[:, -1], y[:, -1]).mean()
         
         self.log(f"{mode}_loss", loss.item())
-        self.log(f"{mode}_mrr", mrr.item())
+
+        if mode in ['val', 'test']:
+            assert self.evaluator is not None
+            assert self.neg_sampler is not None
+            metric = []
+
+            src = x_ind[:, -1].cpu()
+            dst = y[:,-1].cpu()
+            ts = x_time[:, -1].cpu()
+            logits = logits[:, -1].cpu().detach()
+            neg_batch_list = self.neg_sampler.query_batch(
+                src - 1, dst - 1, ts, 
+                split_mode=mode
+            )
+            for idx, neg_batch in enumerate(neg_batch_list):
+                neg_batch = torch.tensor(neg_batch) + 1
+                input_dict = {
+                    "y_pred_pos": logits[idx, dst[idx]],
+                    "y_pred_neg": logits[idx, neg_batch.tolist()],
+                    "eval_metric": ['mrr'],
+                }
+                metric += [self.evaluator.eval(input_dict)['mrr']]
+            self.log(f"{mode}_MRR", torch.tensor(metric).mean().item())
+            
         return loss
 
     def training_step(self, batch, batch_idx):
